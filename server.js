@@ -425,8 +425,105 @@ app.post('/webhook', async (req, res) => {
         }
 
         case 'mark_paid': {
-          // For now, do not insert anything into the database
-          await sendMessage(senderNumber, `Payment/settlement request received for ${customerName}.`);
+          // 1. Validate that customer_name exists
+          if (!result.customer_name) {
+            await sendMessage(
+              senderNumber,
+              "Please specify which customer has paid (e.g. 'Alice cleared her dues')."
+            );
+            break;
+          }
+
+          try {
+            // 2. Find the shop associated with the sender's phone number
+            const shopRes = await db.query(
+              'SELECT id FROM shops WHERE phone_number = $1',
+              [senderNumber]
+            );
+
+            if (shopRes.rows.length === 0) {
+              await sendMessage(
+                senderNumber,
+                `Customer "${result.customer_name}" was not found.`
+              );
+              break;
+            }
+
+            const shopId = shopRes.rows[0].id;
+
+            // 3. Find the customer by name within that shop (case-insensitively)
+            const custRes = await db.query(
+              'SELECT id, name FROM customers WHERE shop_id = $1 AND LOWER(name) = LOWER($2)',
+              [shopId, result.customer_name]
+            );
+
+            if (custRes.rows.length === 0) {
+              await sendMessage(
+                senderNumber,
+                `Customer "${result.customer_name}" was not found.`
+              );
+              break;
+            }
+
+            const customer = custRes.rows[0];
+
+            // 4. Determine the customer's current outstanding balance
+            const balanceRes = await db.query(
+              `SELECT 
+                 COALESCE(
+                   SUM(
+                     CASE 
+                       WHEN type = 'credit' THEN amount
+                       WHEN type = 'payment' THEN -amount
+                       ELSE 0
+                     END
+                   ), 
+                   0
+                 ) AS balance
+               FROM transactions
+               WHERE customer_id = $1`,
+              [customer.id]
+            );
+
+            const currentBalance = parseFloat(balanceRes.rows[0].balance);
+
+            // 5. If customer has no outstanding balance to settle
+            if (currentBalance <= 0) {
+              await sendMessage(
+                senderNumber,
+                `${customer.name} has no outstanding balance to settle.`
+              );
+              break;
+            }
+
+            // 6. Payment amount defaults to the full outstanding balance to clear all dues,
+            // unless a specific partial amount was explicitly specified in the message
+            const isNumericAmount = typeof result.amount === 'number' && !isNaN(result.amount) && result.amount > 0;
+            const paymentAmount = isNumericAmount ? result.amount : currentBalance;
+
+            // 7. Store pending confirmation in memory (reusing pendingTransactions)
+            // Do NOT insert into PostgreSQL yet
+            pendingTransactions.set(senderNumber, {
+              customer_name: customer.name,
+              amount: paymentAmount,
+              type: 'payment'
+            });
+
+            const displayBalance = currentBalance % 1 === 0 ? currentBalance : currentBalance.toFixed(2);
+            const displayPayment = paymentAmount % 1 === 0 ? paymentAmount : paymentAmount.toFixed(2);
+
+            // 8. Ask for confirmation before saving
+            const confirmationText = paymentAmount < currentBalance
+              ? `${customer.name} currently owes you ₹${displayBalance}. Record a payment of ₹${displayPayment}? Reply with YES to confirm.`
+              : `${customer.name} currently owes you ₹${displayBalance}. Record a payment of ₹${displayPayment} to settle the balance? Reply with YES to confirm.`;
+            await sendMessage(senderNumber, confirmationText);
+          } catch (dbError) {
+            console.error('[POST /webhook] Error handling mark_paid:', dbError.message);
+            await sendMessage(
+              senderNumber,
+              'Sorry, an error occurred while processing the settlement request. Please try again.'
+            );
+          }
           break;
         }
 
