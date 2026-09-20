@@ -337,8 +337,90 @@ app.post('/webhook', async (req, res) => {
         }
 
         case 'query_balance': {
-          // Just reply with the requested format (no DB query changes yet)
-          await sendMessage(senderNumber, `Balance lookup received for ${customerName}.`);
+          // If no customer name was extracted, ask for clarification
+          if (!result.customer_name) {
+            await sendMessage(
+              senderNumber,
+              "Please specify whose balance you would like to check (e.g. 'How much does Alice owe me?')."
+            );
+            break;
+          }
+
+          try {
+            // 1. Find the shop associated with the sender's phone number
+            const shopRes = await db.query(
+              'SELECT id FROM shops WHERE phone_number = $1',
+              [senderNumber]
+            );
+
+            if (shopRes.rows.length === 0) {
+              await sendMessage(
+                senderNumber,
+                `Customer "${result.customer_name}" was not found.`
+              );
+              break;
+            }
+
+            const shopId = shopRes.rows[0].id;
+
+            // 2. Find the customer by name within that shop (case-insensitively)
+            const custRes = await db.query(
+              'SELECT id, name FROM customers WHERE shop_id = $1 AND LOWER(name) = LOWER($2)',
+              [shopId, result.customer_name]
+            );
+
+            if (custRes.rows.length === 0) {
+              await sendMessage(
+                senderNumber,
+                `Customer "${result.customer_name}" was not found.`
+              );
+              break;
+            }
+
+            const customer = custRes.rows[0];
+
+            // 3. Calculate balance: credits add, payments subtract
+            // Returns 0 if there are no transactions
+            const balanceRes = await db.query(
+              `SELECT 
+                 COALESCE(
+                   SUM(
+                     CASE 
+                       WHEN type = 'credit' THEN amount
+                       WHEN type = 'payment' THEN -amount
+                       ELSE 0
+                     END
+                   ), 
+                   0
+                 ) AS balance
+               FROM transactions
+               WHERE customer_id = $1`,
+              [customer.id]
+            );
+
+            const balanceNum = parseFloat(balanceRes.rows[0].balance);
+            const displayAmount = balanceNum % 1 === 0 ? balanceNum : balanceNum.toFixed(2);
+
+            // 4. Natural language response based on balance
+            if (balanceNum > 0) {
+              await sendMessage(senderNumber, `${customer.name} owes you ₹${displayAmount}.`);
+            } else if (balanceNum === 0) {
+              await sendMessage(senderNumber, `${customer.name} has no outstanding balance.`);
+            } else {
+              const advanceAmount = Math.abs(balanceNum);
+              const displayAdvance = advanceAmount % 1 === 0 ? advanceAmount : advanceAmount.toFixed(2);
+              await sendMessage(
+                senderNumber,
+                `${customer.name} has an advance balance of ₹${displayAdvance} (paid more than recorded credits).`
+              );
+            }
+          } catch (dbError) {
+            console.error('[POST /webhook] Error querying balance:', dbError.message);
+            await sendMessage(
+              senderNumber,
+              'Sorry, an error occurred while looking up the balance. Please try again.'
+            );
+          }
           break;
         }
 
