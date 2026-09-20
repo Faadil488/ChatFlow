@@ -743,7 +743,7 @@ async function sendWeeklyMondayReminders() {
 
 // Register scheduled cron tasks
 // 1. Daily at 8:00 PM (20:00) Asia/Kolkata
-cron.schedule('* * * * *', sendDailySummary, {
+cron.schedule('0 20 * * *', sendDailySummary, {
   scheduled: true,
   timezone: 'Asia/Kolkata'
 });
