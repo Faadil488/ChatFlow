@@ -67,9 +67,29 @@ async function classifyAndExtract(text) {
 
   const prompt = `You are an AI assistant for a store ledger system.
 Classify the following user message into exactly ONE of these intents:
-- "log_transaction": The user wants to record a credit (borrowed money / goods taken on credit) or a payment.
+
+- "log_transaction": Use this when the user gives a specific transaction amount to record, including a specific payment.
+  Examples:
+  * "Alice paid 100 rupees"
+  * "Alice gave me 200"
+  * "Alice took 500 on credit"
+  * "Record a payment of ₹300 from Alice"
+
 - "query_balance": The user wants to check how much a customer owes or their current balance.
-- "mark_paid": The user indicates a customer paid off their debt, settled their account, or cleared their dues.
+  Examples:
+  * "How much does Alice owe me?"
+  * "What is Alice's balance?"
+  * "Check balance for Alice"
+
+- "mark_paid": Use this ONLY when the user says the customer has completely settled/cleared their outstanding dues without giving a specific transaction amount.
+  Examples:
+  * "Alice cleared her dues"
+  * "Alice settled her account"
+  * "Alice has paid everything"
+  * "Mark Alice as fully paid"
+
+Important rule:
+If a specific amount is provided, ALWAYS classify it as "log_transaction", even if the message contains words like "paid", "settled", or "cleared".
 
 Extract the following information where relevant:
 - customer_name: The name of the customer (string), or null if not mentioned.
@@ -93,7 +113,8 @@ User message: "${text}"`;
     const model = genAI.getGenerativeModel({
       model: process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
       generationConfig: {
-        responseMimeType: 'application/json'
+        responseMimeType: 'application/json',
+        temperature: 0
       }
     });
 
