@@ -155,6 +155,10 @@ app.get('/webhook', (req, res) => {
   return res.status(400).send('Missing required query parameters: hub.mode, hub.verify_token, hub.challenge');
 });
 
+// In-memory store for pending transactions awaiting confirmation
+// Format: senderPhoneNumber -> { customer_name, amount, type }
+const pendingTransactions = new Map();
+
 /**
  * POST /webhook
  * Webhook event handler
@@ -218,17 +222,87 @@ app.post('/webhook', async (req, res) => {
       const messageText = message.text?.body;
       console.log(`[POST /webhook] Received text from ${senderNumber}: "${messageText}"`);
 
+      const trimmedText = messageText ? messageText.trim() : '';
+
       // 1. Keep existing "hi" -> "hello" behavior working
-      if (messageText && messageText.trim().toLowerCase() === 'hi') {
+      if (trimmedText.toLowerCase() === 'hi') {
         console.log(`[POST /webhook] Replying 'hello' to ${senderNumber}...`);
         await sendMessage(senderNumber, 'hello');
         return;
       }
 
-      // 2. Classify intent and extract details
+      // 2. Handle "YES" confirmation for pending transactions
+      if (trimmedText.toLowerCase() === 'yes') {
+        // Check whether this specific sender has a pending transaction waiting
+        const pending = pendingTransactions.get(senderNumber);
+
+        if (!pending) {
+          await sendMessage(senderNumber, 'There is no pending transaction to confirm.');
+          return;
+        }
+
+        try {
+          // Find or create the shop associated with this sender's phone number
+          let shopRes = await db.query('SELECT id FROM shops WHERE phone_number = $1', [senderNumber]);
+          let shopId;
+
+          if (shopRes.rows.length === 0) {
+            const newShop = await db.query(
+              'INSERT INTO shops (phone_number, name) VALUES ($1, $2) RETURNING id',
+              [senderNumber, 'My Shop']
+            );
+            shopId = newShop.rows[0].id;
+          } else {
+            shopId = shopRes.rows[0].id;
+          }
+
+          // Find or create the customer under this shop
+          let custRes = await db.query(
+            'SELECT id, name FROM customers WHERE shop_id = $1 AND LOWER(name) = LOWER($2)',
+            [shopId, pending.customer_name]
+          );
+          let customerId;
+          let customerName;
+
+          if (custRes.rows.length === 0) {
+            const newCust = await db.query(
+              'INSERT INTO customers (shop_id, name) VALUES ($1, $2) RETURNING id, name',
+              [shopId, pending.customer_name]
+            );
+            customerId = newCust.rows[0].id;
+            customerName = newCust.rows[0].name;
+          } else {
+            customerId = custRes.rows[0].id;
+            customerName = custRes.rows[0].name;
+          }
+
+          // Insert the confirmed transaction into the database
+          await db.query(
+            'INSERT INTO transactions (customer_id, amount, type) VALUES ($1, $2, $3)',
+            [customerId, pending.amount, pending.type]
+          );
+
+          // Clear the pending transaction after a successful insert
+          pendingTransactions.delete(senderNumber);
+
+          // Reply confirming it was successfully saved
+          const confirmationReply = `Confirmed! Successfully recorded a ${pending.type} of ₹${pending.amount} for ${customerName}.`;
+          await sendMessage(senderNumber, confirmationReply);
+        } catch (dbError) {
+          console.error('[POST /webhook] Error saving confirmed transaction:', dbError.message);
+          await sendMessage(
+            senderNumber,
+            'Sorry, an error occurred while saving your transaction. Please try again.'
+          );
+        }
+
+        return;
+      }
+
+      // 3. Classify intent and extract details using Gemini
       const result = await classifyAndExtract(messageText);
 
-      // 3. If null, send failure reply
+      // 4. If null, send failure reply
       if (!result) {
         await sendMessage(senderNumber, "Sorry, I couldn't understand that. Please try again.");
         return;
@@ -236,10 +310,10 @@ app.post('/webhook', async (req, res) => {
 
       const customerName = result.customer_name || 'customer';
 
-      // 4. Branch based on intent
+      // 5. Branch based on intent
       switch (result.intent) {
         case 'log_transaction': {
-          // DO NOT insert anything into the database yet
+          // Check that all required fields are present
           if (!result.customer_name || result.amount == null || !result.type) {
             await sendMessage(
               senderNumber,
@@ -248,13 +322,22 @@ app.post('/webhook', async (req, res) => {
             break;
           }
 
+          // Store the pending transaction temporarily in memory for this sender
+          // Do NOT insert anything into PostgreSQL yet
+          pendingTransactions.set(senderNumber, {
+            customer_name: result.customer_name,
+            amount: result.amount,
+            type: result.type
+          });
+
+          // Ask the user to reply YES to confirm
           const confirmationText = `Please confirm: Log a ${result.type} of ₹${result.amount} for ${result.customer_name}? Reply with YES to confirm.`;
           await sendMessage(senderNumber, confirmationText);
           break;
         }
 
         case 'query_balance': {
-          // Just reply with the requested format
+          // Just reply with the requested format (no DB query changes yet)
           await sendMessage(senderNumber, `Balance lookup received for ${customerName}.`);
           break;
         }
