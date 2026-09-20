@@ -1,7 +1,8 @@
 require('dotenv').config();
 const express = require('express');
-
 const axios = require('axios');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const db = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -46,6 +47,84 @@ async function sendMessage(to, text) {
     return response.data;
   } catch (error) {
     console.error(`[sendMessage] Failed to send message to ${to}:`, error.response?.data || error.message);
+  }
+}
+
+/**
+ * Classifies user intent and extracts transaction details using @google/generative-ai.
+ * Keeps the Gemini API call completely isolated inside this function so the provider can be replaced later.
+ *
+ * @param {string} text - Incoming WhatsApp message text
+ * @returns {Promise<{intent: "log_transaction"|"query_balance"|"mark_paid", customer_name: string|null, amount: number|null, type: "credit"|"payment"|null}|null>}
+ */
+async function classifyAndExtract(text) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    console.error('[classifyAndExtract] Missing GEMINI_API_KEY in environment variables.');
+    return null;
+  }
+
+  const prompt = `You are an AI assistant for a store ledger system.
+Classify the following user message into exactly ONE of these intents:
+- "log_transaction": The user wants to record a credit (borrowed money / goods taken on credit) or a payment.
+- "query_balance": The user wants to check how much a customer owes or their current balance.
+- "mark_paid": The user indicates a customer paid off their debt, settled their account, or cleared their dues.
+
+Extract the following information where relevant:
+- customer_name: The name of the customer (string), or null if not mentioned.
+- amount: The monetary amount (number), or null if not mentioned.
+- type: Either "credit" or "payment" (string), or null if not applicable.
+
+You MUST respond ONLY with a valid JSON object matching this schema:
+{
+  "intent": "log_transaction" | "query_balance" | "mark_paid",
+  "customer_name": string | null,
+  "amount": number | null,
+  "type": "credit" | "payment" | null
+}
+
+Do not include any explanations, markdown formatting, or text outside the JSON object.
+
+User message: "${text}"`;
+
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+      generationConfig: {
+        responseMimeType: 'application/json'
+      }
+    });
+
+    let result;
+    try {
+      result = await model.generateContent(prompt);
+    } catch (apiErr) {
+      if (apiErr.message && (apiErr.message.includes('503') || apiErr.message.includes('high demand'))) {
+        console.warn('[classifyAndExtract] Temporary 503 spike, retrying once...');
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        result = await model.generateContent(prompt);
+      } else {
+        throw apiErr;
+      }
+    }
+
+    let rawText = result.response.text();
+
+    // Strip markdown code fences if present (e.g. ```json ... ``` or ``` ... ```)
+    rawText = rawText.replace(/```(?:json)?\n?/gi, '').replace(/```\s*$/gi, '').trim();
+
+    try {
+      const parsed = JSON.parse(rawText);
+      return parsed;
+    } catch (parseError) {
+      console.error('[classifyAndExtract] Failed to parse JSON response:', parseError.message, 'Raw response:', rawText);
+      return null;
+    }
+  } catch (error) {
+    console.error('[classifyAndExtract] Error calling Gemini API:', error.message);
+    return null;
   }
 }
 
@@ -139,12 +218,57 @@ app.post('/webhook', async (req, res) => {
       const messageText = message.text?.body;
       console.log(`[POST /webhook] Received text from ${senderNumber}: "${messageText}"`);
 
-      // If the message is 'hi' (case-insensitive), reply with 'hello'
+      // 1. Keep existing "hi" -> "hello" behavior working
       if (messageText && messageText.trim().toLowerCase() === 'hi') {
         console.log(`[POST /webhook] Replying 'hello' to ${senderNumber}...`);
         await sendMessage(senderNumber, 'hello');
-      } else {
-        console.log(`[POST /webhook] Message "${messageText}" did not match 'hi' (case-insensitive). Skipping reply.`);
+        return;
+      }
+
+      // 2. Classify intent and extract details
+      const result = await classifyAndExtract(messageText);
+
+      // 3. If null, send failure reply
+      if (!result) {
+        await sendMessage(senderNumber, "Sorry, I couldn't understand that. Please try again.");
+        return;
+      }
+
+      const customerName = result.customer_name || 'customer';
+
+      // 4. Branch based on intent
+      switch (result.intent) {
+        case 'log_transaction': {
+          // DO NOT insert anything into the database yet
+          if (!result.customer_name || result.amount == null || !result.type) {
+            await sendMessage(
+              senderNumber,
+              "I need the customer name, amount, and whether this is a credit or payment. Please provide those details."
+            );
+            break;
+          }
+
+          const confirmationText = `Please confirm: Log a ${result.type} of ₹${result.amount} for ${result.customer_name}? Reply with YES to confirm.`;
+          await sendMessage(senderNumber, confirmationText);
+          break;
+        }
+
+        case 'query_balance': {
+          // Just reply with the requested format
+          await sendMessage(senderNumber, `Balance lookup received for ${customerName}.`);
+          break;
+        }
+
+        case 'mark_paid': {
+          // For now, do not insert anything into the database
+          await sendMessage(senderNumber, `Payment/settlement request received for ${customerName}.`);
+          break;
+        }
+
+        default: {
+          await sendMessage(senderNumber, "Sorry, I couldn't understand that. Please try again.");
+          break;
+        }
       }
     }
   } else {
@@ -165,5 +289,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = app;
-
+module.exports = { app, sendMessage, classifyAndExtract };
