@@ -3,6 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('./db');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -563,6 +564,196 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ============================================================================
+// Scheduled Cron Jobs (Asia/Kolkata)
+// ============================================================================
+
+/**
+ * Daily Summary Job
+ * Runs every day at 8:00 PM (Asia/Kolkata timezone).
+ * Loops through all shops, calculates today's total credit given and total payments received,
+ * and sends each shop owner a WhatsApp summary message using sendMessage().
+ * Does NOT send to customers.
+ */
+async function sendDailySummary() {
+  console.log('[Cron: Daily Summary] Running 8:00 PM daily summary job (Asia/Kolkata)...');
+  try {
+    const query = `
+      SELECT 
+        s.id AS shop_id,
+        s.phone_number,
+        s.name AS shop_name,
+        COALESCE(SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END), 0) AS total_credit,
+        COALESCE(SUM(CASE WHEN t.type = 'payment' THEN t.amount ELSE 0 END), 0) AS total_payment,
+        COUNT(t.id) AS transaction_count
+      FROM shops s
+      LEFT JOIN customers c ON c.shop_id = s.id
+      LEFT JOIN transactions t ON t.customer_id = c.id 
+        AND (t.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date
+      WHERE s.phone_number IS NOT NULL
+      GROUP BY s.id, s.phone_number, s.name
+      ORDER BY s.id ASC
+    `;
+
+    const res = await db.query(query);
+    const shops = res.rows;
+
+    if (shops.length === 0) {
+      console.log('[Cron: Daily Summary] No registered shops with phone numbers found.');
+      return;
+    }
+
+    console.log(`[Cron: Daily Summary] Processing summaries for ${shops.length} shop(s)...`);
+
+    for (const shop of shops) {
+      const totalCredit = parseFloat(shop.total_credit);
+      const totalPayment = parseFloat(shop.total_payment);
+      const count = parseInt(shop.transaction_count, 10);
+
+      const displayCredit = totalCredit % 1 === 0 ? totalCredit : totalCredit.toFixed(2);
+      const displayPayment = totalPayment % 1 === 0 ? totalPayment : totalPayment.toFixed(2);
+
+      const summaryMessage =
+        `📊 *Daily Summary - ${shop.shop_name || 'My Shop'}*\n\n` +
+        `💰 *Credit Given Today:* ₹${displayCredit}\n` +
+        `💵 *Payments Received Today:* ₹${displayPayment}\n\n` +
+        (count > 0
+          ? `Total transactions recorded today: ${count}`
+          : `No transactions were recorded today.`);
+
+      try {
+        const sent = await sendMessage(shop.phone_number, summaryMessage);
+        if (sent) {
+          console.log(`[Cron: Daily Summary] Successfully sent summary to shop "${shop.shop_name}" (${shop.phone_number}).`);
+        } else {
+          console.warn(`[Cron: Daily Summary] Could not deliver summary to shop "${shop.shop_name}" (${shop.phone_number}).`);
+        }
+      } catch (sendError) {
+        console.error(`[Cron: Daily Summary] Failed to send summary to shop "${shop.shop_name}" (${shop.phone_number}):`, sendError.message);
+      }
+    }
+
+    console.log('[Cron: Daily Summary] Daily summary job completed.');
+  } catch (error) {
+    console.error('[Cron: Daily Summary] Database query error during daily summary job:', error.message);
+  }
+}
+
+/**
+ * Weekly Monday Reminder Job
+ * Runs every Monday at 10:00 AM (Asia/Kolkata timezone).
+ * Finds all customers with a current balance > 0, groups them by shop,
+ * and sends each shop owner a WhatsApp reminder listing the customers who owe money and how much they owe.
+ * Does NOT message customers directly.
+ */
+async function sendWeeklyMondayReminders() {
+  console.log('[Cron: Monday Reminder] Running 10:00 AM weekly outstanding dues reminder (Asia/Kolkata)...');
+  try {
+    const query = `
+      SELECT 
+        s.id AS shop_id,
+        s.phone_number AS shop_phone,
+        s.name AS shop_name,
+        c.id AS customer_id,
+        c.name AS customer_name,
+        COALESCE(
+          SUM(
+            CASE 
+              WHEN t.type = 'credit' THEN t.amount 
+              WHEN t.type = 'payment' THEN -t.amount 
+              ELSE 0 
+            END
+          ), 
+          0
+        ) AS balance
+      FROM shops s
+      JOIN customers c ON c.shop_id = s.id
+      LEFT JOIN transactions t ON t.customer_id = c.id
+      WHERE s.phone_number IS NOT NULL
+      GROUP BY s.id, s.phone_number, s.name, c.id, c.name
+      HAVING COALESCE(
+        SUM(
+          CASE 
+            WHEN t.type = 'credit' THEN t.amount 
+            WHEN t.type = 'payment' THEN -t.amount 
+            ELSE 0 
+          END
+        ), 
+        0
+      ) > 0
+      ORDER BY s.id ASC, balance DESC, c.name ASC
+    `;
+
+    const res = await db.query(query);
+
+    if (res.rows.length === 0) {
+      console.log('[Cron: Monday Reminder] No customers with outstanding balance found across any shop.');
+      return;
+    }
+
+    // Group customers with outstanding balance by shop
+    const shopsMap = new Map();
+    for (const row of res.rows) {
+      if (!shopsMap.has(row.shop_id)) {
+        shopsMap.set(row.shop_id, {
+          shopId: row.shop_id,
+          shopName: row.shop_name || 'My Shop',
+          phone: row.shop_phone,
+          customers: []
+        });
+      }
+      shopsMap.get(row.shop_id).customers.push({
+        name: row.customer_name,
+        balance: parseFloat(row.balance)
+      });
+    }
+
+    console.log(`[Cron: Monday Reminder] Sending reminders to ${shopsMap.size} shop(s) with outstanding dues...`);
+
+    for (const shop of shopsMap.values()) {
+      let message = `📋 *Weekly Outstanding Dues Reminder - ${shop.shopName}*\n\nHere are the customers who currently owe money:\n\n`;
+      let totalOutstanding = 0;
+
+      for (const customer of shop.customers) {
+        const formattedBalance = customer.balance % 1 === 0 ? customer.balance : customer.balance.toFixed(2);
+        message += `• *${customer.name}*: ₹${formattedBalance}\n`;
+        totalOutstanding += customer.balance;
+      }
+
+      const formattedTotal = totalOutstanding % 1 === 0 ? totalOutstanding : totalOutstanding.toFixed(2);
+      message += `\n*Total Outstanding Balance:* ₹${formattedTotal}`;
+
+      try {
+        const sent = await sendMessage(shop.phone, message);
+        if (sent) {
+          console.log(`[Cron: Monday Reminder] Successfully sent reminder to shop "${shop.shopName}" (${shop.phone}) for ${shop.customers.length} customer(s).`);
+        } else {
+          console.warn(`[Cron: Monday Reminder] Could not deliver reminder to shop "${shop.shopName}" (${shop.phone}).`);
+        }
+      } catch (sendError) {
+        console.error(`[Cron: Monday Reminder] Failed to send reminder to shop "${shop.shopName}" (${shop.phone}):`, sendError.message);
+      }
+    }
+
+    console.log('[Cron: Monday Reminder] Weekly reminder job completed.');
+  } catch (error) {
+    console.error('[Cron: Monday Reminder] Database query error during weekly reminder job:', error.message);
+  }
+}
+
+// Register scheduled cron tasks
+// 1. Daily at 8:00 PM (20:00) Asia/Kolkata
+cron.schedule('* * * * *', sendDailySummary, {
+  scheduled: true,
+  timezone: 'Asia/Kolkata'
+});
+
+// 2. Weekly on Monday at 10:00 AM (10:00) Asia/Kolkata
+cron.schedule('0 10 * * 1', sendWeeklyMondayReminders, {
+  scheduled: true,
+  timezone: 'Asia/Kolkata'
+});
+
 // Start the server
 if (require.main === module) {
   app.listen(PORT, () => {
@@ -572,4 +763,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, sendMessage, classifyAndExtract };
+module.exports = {
+  app,
+  sendMessage,
+  classifyAndExtract,
+  sendDailySummary,
+  sendWeeklyMondayReminders
+};
